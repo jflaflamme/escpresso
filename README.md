@@ -16,6 +16,12 @@ A virtual ESC/POS thermal receipt printer emulator with real-time GUI preview. A
 - **receiptio compatible** — works with the [receiptio](https://github.com/receiptline/receiptio) CLI tool
 - **100+ ESC/POS commands** parsed ([full list](docs/COMMANDS.md))
 
+## Screenshot
+
+![Alignment test showing left, center, and right aligned text and raster images](screenshot_alignment.png)
+
+> The logo shown in the screenshot is property of [GetLoy](https://getloy.com) POS and payment systems. Used here for testing purposes only.
+
 ## Installation
 
 ### From crates.io
