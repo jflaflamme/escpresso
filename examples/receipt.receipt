@@ -1,0 +1,19 @@
+^^^COFFEE SHOP
+
+123 Main Street
+Tel: (555) 123-4567
+
+{border:line}
+|Item            |  Price|
+|Espresso        |  $3.50|
+|Croissant       |  $4.00|
+|Orange Juice    |  $5.00|
+{border:space}
+
+^^Total: $12.50
+
+{code:https://example.com/receipt/001; option:qrcode,3,L}
+
+Thank you for visiting!
+
+{cut}
