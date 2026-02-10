@@ -1,0 +1,15 @@
+{width:auto; align:center}
+"RECEIPT TEST
+{align:left}
+Regular text line
+^Super BIG
+_Underline
+
+{width:2}{height:2}BIG TEXT{width:1}{height:1}
+
+--------------------------------
+{width:auto; align:center}
+
+`Thank you, come again!`
+
+{code:https://innolabs.dev; option:qrcode,3,M}

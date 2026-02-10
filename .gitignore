@@ -1,0 +1,9 @@
+/target
+.claude/
+CLAUDE.md
+/references/
+.DS_Store
+*.swp
+*~
+.idea/
+.vscode/
