@@ -244,11 +244,9 @@ impl EscPosRenderer {
                                 );
                             }
                         }
-                        0x14 => {
+                        0x14 if i + 1 < data.len() => {
                             // DLE DC4 - real-time commands
-                            if i + 1 < data.len() {
-                                i += 2;
-                            }
+                            i += 2;
                         }
                         _ => {}
                     }
