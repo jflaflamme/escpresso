@@ -1961,6 +1961,10 @@ impl eframe::App for VirtualEscPosApp {
                                         });
                                     }
 
+                                    // PM2 sends a receipt as many 24-dot-tall GS v 0 strips.
+                                    // egui's default item_spacing.y inserts a gap between each
+                                    // strip, tearing the stacked image. Strips must butt together.
+                                    ui.spacing_mut().item_spacing.y = 0.0;
                                     for element in elements.iter() {
                                         match element {
                                             ReceiptElement::Text {
