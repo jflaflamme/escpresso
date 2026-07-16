@@ -135,6 +135,7 @@ struct PrinterState {
     character_spacing: u8,
     double_strike: bool,
     font: u8, // 0=Font A, 1=Font B, etc.
+    utf8_mode: bool, // FS ( C fn=48 m=2 - Epson UTF-8 encode system
 }
 
 impl Default for PrinterState {
@@ -156,6 +157,7 @@ impl Default for PrinterState {
             character_spacing: 0,
             double_strike: false,
             font: 0, // Default: Font A
+            utf8_mode: false,
         }
     }
 }
@@ -404,10 +406,19 @@ impl EscPosRenderer {
                         b'(' => {
                             // FS ( fn pL pH [data...] - Extended commands with length
                             if i + 3 < data.len() {
-                                let _fn = data[i]; // function code (e.g., 'A')
+                                let func = data[i]; // function code (e.g., 'A', 'C')
                                 let p_l = data[i + 1] as usize;
                                 let p_h = data[i + 2] as usize;
                                 let len = p_l + (p_h << 8);
+                                // FS ( C pL pH fn m - select character encode system
+                                if func == b'C' && len >= 2 && i + 4 < data.len() && data[i + 3] == 48 {
+                                    let m = data[i + 4];
+                                    self.state.utf8_mode = m == 2 || m == b'2';
+                                    self.log_debug(&format!(
+                                        "FS ( C: utf8_mode = {}",
+                                        self.state.utf8_mode
+                                    ));
+                                }
                                 i += 3 + len.min(data.len() - i);
                             }
                         }
@@ -530,7 +541,10 @@ impl EscPosRenderer {
         }
 
         // Decode bytes using current codepage
-        let decoded = if self.state.code_page == 0 {
+        let decoded = if self.state.utf8_mode {
+            // FS ( C selected the UTF-8 encode system (modern Epson)
+            String::from_utf8_lossy(&self.current_line).into_owned()
+        } else if self.state.code_page == 0 {
             // CP437 - use codepage-437 crate
             String::borrow_from_cp437(&self.current_line, &CP437_CONTROL)
         } else {
@@ -789,19 +803,29 @@ impl EscPosRenderer {
                     self.state.code_page = data[i];
                     // Map codepage numbers to encoding_rs encodings
                     // Note: CP437 (codepage 0) is handled specially in flush_line()
+                    // Epson ESC t page assignments mapped to the closest
+                    // encoding_rs equivalent (exact where the Encoding
+                    // Standard has the code page, approximated otherwise).
                     self.state.encoding = match data[i] {
-                        0 => encoding_rs::WINDOWS_1252,  // CP437 (handled specially)
-                        1 => encoding_rs::WINDOWS_1252,  // Katakana (approximation)
-                        2 => encoding_rs::WINDOWS_1252,  // CP850
-                        3 => encoding_rs::WINDOWS_1252,  // CP860
-                        4 => encoding_rs::WINDOWS_1252,  // CP863
-                        5 => encoding_rs::WINDOWS_1252,  // CP865
-                        16 => encoding_rs::WINDOWS_1252, // Windows-1252 (Western European)
-                        17 => encoding_rs::WINDOWS_1251, // CP866 -> Windows-1251 (Cyrillic)
-                        18 => encoding_rs::WINDOWS_1250, // CP852 -> Windows-1250 (Central European)
-                        19 => encoding_rs::WINDOWS_1252, // CP858 (like CP850 with Euro)
-                        20 => encoding_rs::SHIFT_JIS,    // Shift JIS (Japanese)
-                        21 => encoding_rs::SHIFT_JIS,
+                        0 => encoding_rs::WINDOWS_1252, // CP437 (handled specially)
+                        1 => encoding_rs::SHIFT_JIS,    // Katakana (JIS X 0201 approx.)
+                        2 | 19 => encoding_rs::WINDOWS_1252, // CP850/CP858 (approx.)
+                        3 | 4 | 5 | 35 => encoding_rs::WINDOWS_1252, // CP860/863/865/861 (approx.)
+                        11 | 14 | 46 => encoding_rs::WINDOWS_1253, // Greek: CP851/CP737/WPC1253
+                        12 | 13 | 47 => encoding_rs::WINDOWS_1254, // Turkish: CP853/CP857/WPC1254
+                        15 => encoding_rs::ISO_8859_7,  // ISO8859-7 (Greek)
+                        16 => encoding_rs::WINDOWS_1252, // WPC1252
+                        17 | 43 => encoding_rs::IBM866, // CP866 / CP1125 (approx.)
+                        18 => encoding_rs::WINDOWS_1250, // CP852 (approx.)
+                        20..=26 => encoding_rs::WINDOWS_874, // Thai codes 42/11/13/14/16/17/18
+                        30 | 31 | 51 => encoding_rs::WINDOWS_1258, // Vietnamese: TCVN-3/WPC1258
+                        32 | 37 | 40 | 49 => encoding_rs::WINDOWS_1256, // Arabic/Farsi (approx.)
+                        33 | 50 => encoding_rs::WINDOWS_1257, // Baltic: WPC775/WPC1257
+                        34 | 45 => encoding_rs::WINDOWS_1251, // Cyrillic: CP855/WPC1251
+                        36 | 48 => encoding_rs::WINDOWS_1255, // Hebrew: CP862/WPC1255 (approx.)
+                        38 => encoding_rs::ISO_8859_2,  // ISO8859-2
+                        39 => encoding_rs::ISO_8859_15, // ISO8859-15
+                        44 => encoding_rs::WINDOWS_1250, // WPC1250
                         255 => encoding_rs::SHIFT_JIS,
                         _ => encoding_rs::WINDOWS_1252, // Default fallback
                     };
@@ -1750,7 +1774,42 @@ struct VirtualEscPosApp {
 }
 
 impl VirtualEscPosApp {
-    fn new(_cc: &eframe::CreationContext, state: AppState) -> Self {
+    fn new(cc: &eframe::CreationContext, state: AppState) -> Self {
+        // Register system fallback fonts so decoded non-Latin text
+        // renders instead of tofu boxes: a dedicated Thai face first
+        // (nicer glyphs), then a broad-coverage face (CJK, Cyrillic,
+        // Greek, Hebrew, Arabic, Vietnamese, ...). Paths are per-OS
+        // candidates; missing files are skipped silently.
+        let mut fonts = egui::FontDefinitions::default();
+        for (name, path) in [
+            // macOS
+            ("thai-fallback", "/System/Library/Fonts/Supplemental/Ayuthaya.ttf"),
+            ("unicode-fallback", "/Library/Fonts/Arial Unicode.ttf"),
+            ("unicode-fallback", "/System/Library/Fonts/Supplemental/Arial Unicode.ttf"),
+            // Windows (Tahoma covers Thai + Cyrillic + Greek + Hebrew + Arabic)
+            ("thai-fallback", "C:\\Windows\\Fonts\\leelawui.ttf"),
+            ("unicode-fallback", "C:\\Windows\\Fonts\\tahoma.ttf"),
+            // Linux (Noto)
+            ("thai-fallback", "/usr/share/fonts/truetype/noto/NotoSansThai-Regular.ttf"),
+            ("unicode-fallback", "/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf"),
+        ] {
+            if fonts.font_data.contains_key(name) {
+                continue;
+            }
+            if let Ok(bytes) = std::fs::read(path) {
+                fonts
+                    .font_data
+                    .insert(name.to_owned(), egui::FontData::from_owned(bytes));
+                for family in [egui::FontFamily::Monospace, egui::FontFamily::Proportional] {
+                    fonts
+                        .families
+                        .entry(family)
+                        .or_default()
+                        .push(name.to_owned());
+                }
+            }
+        }
+        cc.egui_ctx.set_fonts(fonts);
         Self { state }
     }
 }
