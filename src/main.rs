@@ -134,7 +134,7 @@ struct PrinterState {
     line_spacing: u8,
     character_spacing: u8,
     double_strike: bool,
-    font: u8, // 0=Font A, 1=Font B, etc.
+    font: u8,        // 0=Font A, 1=Font B, etc.
     utf8_mode: bool, // FS ( C fn=48 m=2 - Epson UTF-8 encode system
 }
 
@@ -319,19 +319,17 @@ impl EscPosRenderer {
                         i = start_pos;
                         break;
                     }
-                    match self.handle_esc_command(&data, i) {
-                        Ok(new_i) => {
-                            if new_i == i || new_i <= start_pos {
-                                // Handler didn't make progress - waiting for more data
-                                i = start_pos;
-                                // Keep in_command_sequence = true
-                                break;
-                            }
-                            i = new_i;
-                            // Command fully processed - allow text accumulation again
-                            self.in_command_sequence = false;
+                    {
+                        let new_i = self.handle_esc_command(&data, i)?;
+                        if new_i == i || new_i <= start_pos {
+                            // Handler didn't make progress - waiting for more data
+                            i = start_pos;
+                            // Keep in_command_sequence = true
+                            break;
                         }
-                        Err(e) => return Err(e),
+                        i = new_i;
+                        // Command fully processed - allow text accumulation again
+                        self.in_command_sequence = false;
                     }
                 }
                 GS => {
@@ -342,19 +340,17 @@ impl EscPosRenderer {
                         i = start_pos;
                         break;
                     }
-                    match self.handle_gs_command(&data, i) {
-                        Ok(new_i) => {
-                            if new_i == i || new_i <= start_pos {
-                                // Handler didn't make progress - waiting for more data
-                                i = start_pos;
-                                // Keep in_command_sequence = true
-                                break;
-                            }
-                            i = new_i;
-                            // Command fully processed - allow text accumulation again
-                            self.in_command_sequence = false;
+                    {
+                        let new_i = self.handle_gs_command(&data, i)?;
+                        if new_i == i || new_i <= start_pos {
+                            // Handler didn't make progress - waiting for more data
+                            i = start_pos;
+                            // Keep in_command_sequence = true
+                            break;
                         }
-                        Err(e) => return Err(e),
+                        i = new_i;
+                        // Command fully processed - allow text accumulation again
+                        self.in_command_sequence = false;
                     }
                 }
                 FS => {
@@ -411,7 +407,11 @@ impl EscPosRenderer {
                                 let p_h = data[i + 2] as usize;
                                 let len = p_l + (p_h << 8);
                                 // FS ( C pL pH fn m - select character encode system
-                                if func == b'C' && len >= 2 && i + 4 < data.len() && data[i + 3] == 48 {
+                                if func == b'C'
+                                    && len >= 2
+                                    && i + 4 < data.len()
+                                    && data[i + 3] == 48
+                                {
                                     let m = data[i + 4];
                                     self.state.utf8_mode = m == 2 || m == b'2';
                                     self.log_debug(&format!(
@@ -807,25 +807,25 @@ impl EscPosRenderer {
                     // encoding_rs equivalent (exact where the Encoding
                     // Standard has the code page, approximated otherwise).
                     self.state.encoding = match data[i] {
-                        0 => encoding_rs::WINDOWS_1252, // CP437 (handled specially)
-                        1 => encoding_rs::SHIFT_JIS,    // Katakana (JIS X 0201 approx.)
+                        0 => encoding_rs::WINDOWS_1252,      // CP437 (handled specially)
+                        1 => encoding_rs::SHIFT_JIS,         // Katakana (JIS X 0201 approx.)
                         2 | 19 => encoding_rs::WINDOWS_1252, // CP850/CP858 (approx.)
                         3 | 4 | 5 | 35 => encoding_rs::WINDOWS_1252, // CP860/863/865/861 (approx.)
                         11 | 14 | 46 => encoding_rs::WINDOWS_1253, // Greek: CP851/CP737/WPC1253
                         12 | 13 | 47 => encoding_rs::WINDOWS_1254, // Turkish: CP853/CP857/WPC1254
-                        15 => encoding_rs::ISO_8859_7,  // ISO8859-7 (Greek)
-                        16 => encoding_rs::WINDOWS_1252, // WPC1252
-                        17 | 43 => encoding_rs::IBM866, // CP866 / CP1125 (approx.)
-                        18 => encoding_rs::WINDOWS_1250, // CP852 (approx.)
+                        15 => encoding_rs::ISO_8859_7,       // ISO8859-7 (Greek)
+                        16 => encoding_rs::WINDOWS_1252,     // WPC1252
+                        17 | 43 => encoding_rs::IBM866,      // CP866 / CP1125 (approx.)
+                        18 => encoding_rs::WINDOWS_1250,     // CP852 (approx.)
                         20..=26 => encoding_rs::WINDOWS_874, // Thai codes 42/11/13/14/16/17/18
                         30 | 31 | 51 => encoding_rs::WINDOWS_1258, // Vietnamese: TCVN-3/WPC1258
                         32 | 37 | 40 | 49 => encoding_rs::WINDOWS_1256, // Arabic/Farsi (approx.)
                         33 | 50 => encoding_rs::WINDOWS_1257, // Baltic: WPC775/WPC1257
                         34 | 45 => encoding_rs::WINDOWS_1251, // Cyrillic: CP855/WPC1251
                         36 | 48 => encoding_rs::WINDOWS_1255, // Hebrew: CP862/WPC1255 (approx.)
-                        38 => encoding_rs::ISO_8859_2,  // ISO8859-2
-                        39 => encoding_rs::ISO_8859_15, // ISO8859-15
-                        44 => encoding_rs::WINDOWS_1250, // WPC1250
+                        38 => encoding_rs::ISO_8859_2,       // ISO8859-2
+                        39 => encoding_rs::ISO_8859_15,      // ISO8859-15
+                        44 => encoding_rs::WINDOWS_1250,     // WPC1250
                         255 => encoding_rs::SHIFT_JIS,
                         _ => encoding_rs::WINDOWS_1252, // Default fallback
                     };
@@ -1769,7 +1769,9 @@ mod multilang_tests {
         assert!(!renderer.state.utf8_mode);
 
         // FS ( C pL pH fn m -- fn=48, m=2 selects the UTF-8 encode system
-        renderer.process_data(b"\x1C\x28\x43\x02\x00\x30\x02").unwrap();
+        renderer
+            .process_data(b"\x1C\x28\x43\x02\x00\x30\x02")
+            .unwrap();
         assert!(
             renderer.state.utf8_mode,
             "FS ( C fn=48 m=2 should enable utf8_mode"
@@ -1779,7 +1781,9 @@ mod multilang_tests {
     #[test]
     fn esc_at_resets_utf8_mode() {
         let mut renderer = EscPosRenderer::new(false);
-        renderer.process_data(b"\x1C\x28\x43\x02\x00\x30\x02").unwrap();
+        renderer
+            .process_data(b"\x1C\x28\x43\x02\x00\x30\x02")
+            .unwrap();
         assert!(renderer.state.utf8_mode);
 
         renderer.process_data(b"\x1B\x40").unwrap(); // ESC @ initialize
@@ -1871,15 +1875,27 @@ impl VirtualEscPosApp {
         let mut fonts = egui::FontDefinitions::default();
         for (name, path) in [
             // macOS
-            ("thai-fallback", "/System/Library/Fonts/Supplemental/Ayuthaya.ttf"),
+            (
+                "thai-fallback",
+                "/System/Library/Fonts/Supplemental/Ayuthaya.ttf",
+            ),
             ("unicode-fallback", "/Library/Fonts/Arial Unicode.ttf"),
-            ("unicode-fallback", "/System/Library/Fonts/Supplemental/Arial Unicode.ttf"),
+            (
+                "unicode-fallback",
+                "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
+            ),
             // Windows (Tahoma covers Thai + Cyrillic + Greek + Hebrew + Arabic)
             ("thai-fallback", "C:\\Windows\\Fonts\\leelawui.ttf"),
             ("unicode-fallback", "C:\\Windows\\Fonts\\tahoma.ttf"),
             // Linux (Noto)
-            ("thai-fallback", "/usr/share/fonts/truetype/noto/NotoSansThai-Regular.ttf"),
-            ("unicode-fallback", "/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf"),
+            (
+                "thai-fallback",
+                "/usr/share/fonts/truetype/noto/NotoSansThai-Regular.ttf",
+            ),
+            (
+                "unicode-fallback",
+                "/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf",
+            ),
         ] {
             if fonts.font_data.contains_key(name) {
                 continue;
@@ -2071,7 +2087,7 @@ impl eframe::App for VirtualEscPosApp {
                     // Receipt paper frame with border
                     egui::Frame::none()
                         .fill(egui::Color32::WHITE)
-                        .stroke(egui::Stroke::new(1.0, egui::Color32::from_gray(200)))
+                        .stroke(egui::Stroke::new(1.0_f32, egui::Color32::from_gray(200)))
                         .inner_margin(0.0)
                         .show(ui, |ui| {
                             egui::ScrollArea::vertical()
@@ -2207,7 +2223,7 @@ impl eframe::App for VirtualEscPosApp {
                                                         color,
                                                         background: bg_color,
                                                         underline: if *underline {
-                                                            egui::Stroke::new(1.0, color)
+                                                            egui::Stroke::new(1.0_f32, color)
                                                         } else {
                                                             egui::Stroke::NONE
                                                         },
