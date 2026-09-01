@@ -1752,6 +1752,94 @@ impl EscPosRenderer {
     }
 }
 
+#[cfg(test)]
+mod multilang_tests {
+    use super::*;
+
+    fn flushed_text(renderer: &mut EscPosRenderer) -> String {
+        match renderer.take_elements().into_iter().next() {
+            Some(ReceiptElement::Text { content, .. }) => content,
+            other => panic!("expected a Text element, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn fs_c_fn48_m2_enables_utf8_mode() {
+        let mut renderer = EscPosRenderer::new(false);
+        assert!(!renderer.state.utf8_mode);
+
+        // FS ( C pL pH fn m -- fn=48, m=2 selects the UTF-8 encode system
+        renderer.process_data(b"\x1C\x28\x43\x02\x00\x30\x02").unwrap();
+        assert!(
+            renderer.state.utf8_mode,
+            "FS ( C fn=48 m=2 should enable utf8_mode"
+        );
+    }
+
+    #[test]
+    fn esc_at_resets_utf8_mode() {
+        let mut renderer = EscPosRenderer::new(false);
+        renderer.process_data(b"\x1C\x28\x43\x02\x00\x30\x02").unwrap();
+        assert!(renderer.state.utf8_mode);
+
+        renderer.process_data(b"\x1B\x40").unwrap(); // ESC @ initialize
+        assert!(
+            !renderer.state.utf8_mode,
+            "ESC @ should reset utf8_mode back to false"
+        );
+    }
+
+    #[test]
+    fn utf8_mode_decodes_multibyte_text_as_is() {
+        let mut renderer = EscPosRenderer::new(false);
+        let mut data = b"\x1C\x28\x43\x02\x00\x30\x02".to_vec(); // FS ( C -> utf8 on
+        data.extend_from_slice("Борщ".as_bytes());
+        data.push(b'\n');
+
+        renderer.process_data(&data).unwrap();
+        assert_eq!(flushed_text(&mut renderer), "Борщ");
+    }
+
+    #[test]
+    fn esc_at_reset_restores_codepage_decoding_after_utf8_mode() {
+        // Regression for the reset path: switching into UTF-8 mode and then
+        // back out must not leave stray state that corrupts a subsequent
+        // legacy-codepage line.
+        let (cp1251_bytes, _, had_errors) = encoding_rs::WINDOWS_1251.encode("Борщ");
+        assert!(!had_errors);
+
+        let mut renderer = EscPosRenderer::new(false);
+        let mut data = b"\x1C\x28\x43\x02\x00\x30\x02".to_vec(); // FS ( C -> utf8 on
+        data.extend_from_slice(b"\x1B\x40"); // ESC @ -> reset (utf8 off)
+        data.extend_from_slice(b"\x1B\x74\x2D"); // ESC t 45 -> windows-1251
+        data.extend_from_slice(&cp1251_bytes);
+        data.push(b'\n');
+
+        renderer.process_data(&data).unwrap();
+        assert_eq!(flushed_text(&mut renderer), "Борщ");
+    }
+
+    #[test]
+    fn esc_t_maps_new_codepages_to_expected_encodings() {
+        let cases: &[(u8, &encoding_rs::Encoding)] = &[
+            (21, encoding_rs::WINDOWS_874),  // Thai
+            (51, encoding_rs::WINDOWS_1258), // Vietnamese
+            (45, encoding_rs::WINDOWS_1251), // Cyrillic
+            (15, encoding_rs::ISO_8859_7),   // Greek
+        ];
+        for &(page, expected) in cases {
+            let mut renderer = EscPosRenderer::new(false);
+            renderer.process_data(&[0x1B, b't', page]).unwrap();
+            assert_eq!(
+                renderer.state.encoding.name(),
+                expected.name(),
+                "ESC t {page} should map to {}",
+                expected.name()
+            );
+        }
+    }
+}
+
 #[derive(Clone)]
 struct AppState {
     elements: Arc<Mutex<Vec<ReceiptElement>>>,
