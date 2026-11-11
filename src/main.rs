@@ -34,6 +34,9 @@ const DC4: u8 = 0x14;
 const ETB: u8 = 0x17;
 const RS: u8 = 0x1E;
 
+// Height of a blank line (LF on an empty line) in dots: the default line spacing of 1/6 inch at 203 dpi.
+const BLANK_LINE_DOTS: f32 = 34.0;
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum PaperSize {
     Size58mm,
@@ -94,6 +97,8 @@ enum ReceiptElement {
     QrCode {
         data: String,
         size: usize,
+        // GS ( k fn 69: 48 = L, 49 = M, 50 = Q, 51 = H
+        error_correction: u8,
         alignment: Alignment,
         offset: u16,
         print_area_width: u16,
@@ -547,6 +552,9 @@ impl EscPosRenderer {
         } else if self.state.code_page == 0 {
             // CP437 - use codepage-437 crate
             String::borrow_from_cp437(&self.current_line, &CP437_CONTROL)
+        } else if self.state.code_page == 2 || self.state.code_page == 19 {
+            // PC850 / PC858 (Epson ESC t 2 / ESC t 19): own table, encoding_rs has neither
+            decode_pc850(&self.current_line, self.state.code_page == 19)
         } else {
             // Other codepages - use encoding_rs
             let (decoded_cow, _encoding_used, had_errors) =
@@ -1031,12 +1039,12 @@ impl EscPosRenderer {
             }
             b'!' => {
                 // GS ! - Select character size (width and height multipliers)
-                // Bits 0-2: width (0-7), Bits 4-6: height (0-7)
+                // Epson ESC/POS: bits 0-3 height (0-7), bits 4-7 width (0-7)
                 i += 1;
                 if i < data.len() {
                     let mode = data[i];
-                    let width_mul = (mode & 0x07) + 1;
-                    let height_mul = ((mode >> 4) & 0x07) + 1;
+                    let height_mul = (mode & 0x07) + 1;
+                    let width_mul = ((mode >> 4) & 0x07) + 1;
                     self.state.double_width = width_mul > 1;
                     self.state.double_height = height_mul > 1;
                     i += 1;
@@ -1662,39 +1670,40 @@ impl EscPosRenderer {
 
         i += 4;
 
+        // the parameters after cn and fn: pL + pH * 256 counts cn, fn and the parameters
+        let params = param_len.saturating_sub(2);
+        if i + params > data.len() {
+            self.log_debug("GS ( k incomplete: parameters missing");
+            return Ok(start_i);
+        }
+        let params_end = i + params;
+
         if cn != 49 {
             // Not a QR code command
-            let skip = param_len.saturating_sub(2);
-            i += skip.min(data.len() - i);
-            return Ok(i);
+            return Ok(params_end);
         }
 
         match fn_code {
-            65 | 67 => {
-                // 65: Set QR model, 67: Set module size
-                if i < data.len() {
-                    if fn_code == 67 {
-                        self.qr_size = data[i];
-                    }
-                    i += 1;
+            65 => {
+                // Select the model: n1 n2 (model 1/2/micro); the renderer always draws model 2
+            }
+            67 => {
+                // Set the module size: n
+                if params >= 1 {
+                    self.qr_size = data[i];
                 }
             }
             69 => {
-                // Set error correction level
-                if i < data.len() {
+                // Select the error correction level: n (48 = L, 49 = M, 50 = Q, 51 = H)
+                if params >= 1 {
                     self.qr_error_correction = data[i];
-                    i += 1;
                 }
             }
             80 => {
-                // Store QR data
-                let data_len = param_len.saturating_sub(3);
-                if i + data_len > data.len() {
-                    self.log_debug("GS ( k QR data incomplete");
-                    return Ok(start_i);
+                // Store the data: m (48) d1 ... dk with k = pL + pH * 256 - 3
+                if params >= 1 {
+                    self.qr_data = data[i + 1..params_end].to_vec();
                 }
-                self.qr_data = data[i..i + data_len].to_vec();
-                i += data_len;
             }
             81 => {
                 // Print QR code
@@ -1710,6 +1719,7 @@ impl EscPosRenderer {
                     self.elements.push(ReceiptElement::QrCode {
                         data: qr_string,
                         size,
+                        error_correction: self.qr_error_correction,
                         alignment: self.state.alignment.clone(),
                         offset: self.state.horizontal_offset,
                         print_area_width: self.state.print_area_width,
@@ -1722,13 +1732,11 @@ impl EscPosRenderer {
                 }
             }
             _ => {
-                // Unknown QR function
-                let skip = param_len.saturating_sub(2);
-                i += skip.min(data.len() - i);
+                // Another QR function (e.g. 82: transmit size information): its parameters are skipped
             }
         }
 
-        Ok(i)
+        Ok(params_end)
     }
 
     fn handle_paper_cut(&mut self, data: &[u8], mut i: usize) -> Result<usize> {
@@ -1761,6 +1769,131 @@ mod multilang_tests {
             Some(ReceiptElement::Text { content, .. }) => content,
             other => panic!("expected a Text element, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn esc_t_19_decodes_pc858_with_euro_and_german_letters() {
+        let mut renderer = EscPosRenderer::new(false);
+        // ESC t 19, then "ÄÖÜäöüß € § × ·" in PC858
+        let mut data = b"\x1B\x74\x13".to_vec();
+        data.extend_from_slice(&[
+            0x8E, 0x99, 0x9A, 0x84, 0x94, 0x81, 0xE1, b' ', 0xD5, b' ', 0xF5, b' ', 0x9E, b' ',
+            0xFA, b'\n',
+        ]);
+        renderer.process_data(&data).unwrap();
+        assert_eq!(flushed_text(&mut renderer), "ÄÖÜäöüß € § × ·");
+    }
+
+    #[test]
+    fn gs_exclamation_reads_height_from_the_low_and_width_from_the_high_bits() {
+        let mut renderer = EscPosRenderer::new(false);
+        // GS ! 0x01: double height only; GS ! 0x10: double width only
+        renderer
+            .process_data(&[0x1D, 0x21, 0x01, b'H', b'\n', 0x1D, 0x21, 0x10, b'W', b'\n'])
+            .unwrap();
+        let sizes: Vec<(bool, bool)> = renderer
+            .take_elements()
+            .into_iter()
+            .filter_map(|element| match element {
+                ReceiptElement::Text {
+                    double_width,
+                    double_height,
+                    ..
+                } => Some((double_width, double_height)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(sizes, vec![(false, true), (true, false)]);
+    }
+
+    #[test]
+    fn esc_t_2_decodes_pc850_with_dotless_i() {
+        let mut renderer = EscPosRenderer::new(false);
+        renderer
+            .process_data(&[0x1B, 0x74, 0x02, 0xD5, 0xE1, b'\n'])
+            .unwrap();
+        assert_eq!(flushed_text(&mut renderer), "ıß");
+    }
+
+    fn qr_sequence(payload: &[u8]) -> Vec<u8> {
+        let mut data = vec![0x1D, 0x28, 0x6B, 0x04, 0x00, 0x31, 0x41, 0x32, 0x00]; // model 2
+        data.extend_from_slice(&[0x1D, 0x28, 0x6B, 0x03, 0x00, 0x31, 0x43, 0x05]); // module size 5
+        data.extend_from_slice(&[0x1D, 0x28, 0x6B, 0x03, 0x00, 0x31, 0x45, 0x31]); // error correction M
+        let length = payload.len() + 3;
+        data.extend_from_slice(&[
+            0x1D,
+            0x28,
+            0x6B,
+            (length & 0xFF) as u8,
+            (length >> 8) as u8,
+            0x31,
+            0x50,
+            0x30,
+        ]);
+        data.extend_from_slice(payload);
+        data.extend_from_slice(&[0x1D, 0x28, 0x6B, 0x03, 0x00, 0x31, 0x51, 0x30]); // print
+        data.push(b'\n');
+        data
+    }
+
+    #[test]
+    fn gs_k_stores_exactly_the_data_and_prints_no_parameter_bytes() {
+        let mut renderer = EscPosRenderer::new(false);
+        renderer
+            .process_data(&qr_sequence(
+                b"SYNTHETIC;PAYLOAD-0123456789;ABC_def+ghi/jkl=",
+            ))
+            .unwrap();
+        let elements = renderer.take_elements();
+        let qr: Vec<_> = elements
+            .iter()
+            .filter_map(|element| match element {
+                ReceiptElement::QrCode {
+                    data,
+                    size,
+                    error_correction,
+                    ..
+                } => Some((data.clone(), *size, *error_correction)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            qr,
+            vec![(
+                "SYNTHETIC;PAYLOAD-0123456789;ABC_def+ghi/jkl=".to_string(),
+                5,
+                0x31
+            )]
+        );
+        let texts: Vec<_> = elements
+            .iter()
+            .filter_map(|element| match element {
+                ReceiptElement::Text { content, .. } if !content.trim().is_empty() => {
+                    Some(content.clone())
+                }
+                _ => None,
+            })
+            .collect();
+        assert!(
+            texts.is_empty(),
+            "parameter bytes printed as text: {:?}",
+            texts
+        );
+    }
+
+    #[test]
+    fn gs_k_with_a_long_payload_uses_both_length_bytes() {
+        let payload = vec![b'A'; 300];
+        let mut renderer = EscPosRenderer::new(false);
+        renderer.process_data(&qr_sequence(&payload)).unwrap();
+        let stored = renderer
+            .take_elements()
+            .into_iter()
+            .find_map(|element| match element {
+                ReceiptElement::QrCode { data, .. } => Some(data),
+                _ => None,
+            });
+        assert_eq!(stored, Some("A".repeat(300)));
     }
 
     #[test]
@@ -2179,9 +2312,17 @@ impl eframe::App for VirtualEscPosApp {
                                                 };
 
                                                 let mut size = base_font_size * font_multiplier;
-                                                if *double_width || *double_height {
+                                                // Only a wider character takes more columns; double height
+                                                // alone keeps the width and gets a taller line.
+                                                if *double_width {
                                                     size = base_font_size * font_multiplier * 1.5;
                                                 }
+                                                let tall_line = if *double_height && !*double_width
+                                                {
+                                                    Some(size * 2.0)
+                                                } else {
+                                                    None
+                                                };
 
                                                 // Always use monospace for consistent character widths
                                                 // ESC/POS printers use fixed-width fonts
@@ -2228,6 +2369,8 @@ impl eframe::App for VirtualEscPosApp {
                                                             egui::Stroke::NONE
                                                         },
                                                         extra_letter_spacing,
+                                                        line_height: tall_line,
+                                                        valign: egui::Align::BOTTOM,
                                                         ..Default::default()
                                                     },
                                                 );
@@ -2313,6 +2456,7 @@ impl eframe::App for VirtualEscPosApp {
                                             ReceiptElement::QrCode {
                                                 data,
                                                 size,
+                                                error_correction,
                                                 alignment,
                                                 offset,
                                                 print_area_width,
@@ -2321,6 +2465,7 @@ impl eframe::App for VirtualEscPosApp {
                                                     ui,
                                                     data,
                                                     *size,
+                                                    *error_correction,
                                                     alignment,
                                                     *offset,
                                                     *print_area_width,
@@ -2354,7 +2499,9 @@ impl eframe::App for VirtualEscPosApp {
                                                 ui.separator();
                                             }
                                             ReceiptElement::Separator => {
-                                                ui.add_space(4.0);
+                                                // A blank line feeds one line at the default line spacing
+                                                // (Epson ESC 2: 1/6 inch, about 34 dots at 203 dpi).
+                                                ui.add_space(BLANK_LINE_DOTS);
                                             }
                                             ReceiptElement::FormFeed => {
                                                 // Don't add artificial spacing - only show protocol breaks
@@ -2480,16 +2627,50 @@ fn render_raster_image(
     );
 }
 
+// GS ( k fn 69 n: 48 = L (also the printer default), 49 = M, 50 = Q, 51 = H
+fn qr_ec_level(n: u8) -> qrcode::EcLevel {
+    match n {
+        49 => qrcode::EcLevel::M,
+        50 => qrcode::EcLevel::Q,
+        51 => qrcode::EcLevel::H,
+        _ => qrcode::EcLevel::L,
+    }
+}
+
+// Code page PC850 (0x80-0xFF); PC858 is PC850 with the euro sign at 0xD5 (instead of the dotless i).
+const PC850_HIGH: [char; 128] = [
+    'Ç', 'ü', 'é', 'â', 'ä', 'à', 'å', 'ç', 'ê', 'ë', 'è', 'ï', 'î', 'ì', 'Ä', 'Å', 'É', 'æ', 'Æ',
+    'ô', 'ö', 'ò', 'û', 'ù', 'ÿ', 'Ö', 'Ü', 'ø', '£', 'Ø', '×', 'ƒ', 'á', 'í', 'ó', 'ú', 'ñ', 'Ñ',
+    'ª', 'º', '¿', '®', '¬', '½', '¼', '¡', '«', '»', '░', '▒', '▓', '│', '┤', 'Á', 'Â', 'À', '©',
+    '╣', '║', '╗', '╝', '¢', '¥', '┐', '└', '┴', '┬', '├', '─', '┼', 'ã', 'Ã', '╚', '╔', '╩', '╦',
+    '╠', '═', '╬', '¤', 'ð', 'Ð', 'Ê', 'Ë', 'È', 'ı', 'Í', 'Î', 'Ï', '┘', '┌', '█', '▄', '¦', 'Ì',
+    '▀', 'Ó', 'ß', 'Ô', 'Ò', 'õ', 'Õ', 'µ', 'þ', 'Þ', 'Ú', 'Û', 'Ù', 'ý', 'Ý', '¯', '´', '\u{AD}',
+    '±', '‗', '¾', '¶', '§', '÷', '¸', '°', '¨', '·', '¹', '³', '²', '■', '\u{A0}',
+];
+
+fn decode_pc850(bytes: &[u8], euro: bool) -> String {
+    bytes
+        .iter()
+        .map(|&byte| match byte {
+            0xD5 if euro => '€',
+            0x80..=0xFF => PC850_HIGH[(byte - 0x80) as usize],
+            _ => byte as char,
+        })
+        .collect()
+}
+
+#[allow(clippy::too_many_arguments)]
 fn render_qr_code(
     ui: &mut egui::Ui,
     data: &str,
     size: usize,
+    error_correction: u8,
     alignment: &Alignment,
     offset: u16,
     print_area_width: u16,
     printer_width_px: f32,
 ) {
-    match QrCode::new(data.as_bytes()) {
+    match QrCode::with_error_correction_level(data.as_bytes(), qr_ec_level(error_correction)) {
         Ok(qr) => {
             let colors = qr.to_colors();
             let width = qr.width();
