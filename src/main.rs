@@ -3,6 +3,8 @@ use codepage_437::{BorrowFromCp437, CP437_CONTROL};
 use eframe::egui;
 use encoding_rs::Encoding;
 use qrcode::{Color as QrColor, QrCode};
+
+mod barcode;
 use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
@@ -98,6 +100,21 @@ enum ReceiptElement {
         offset: u16,
         print_area_width: u16,
     },
+    Barcode {
+        /// The symbology's name, for an error message.
+        symbology: &'static str,
+        /// One entry per module, left to right: 1 = bar, 0 = space; or why
+        /// the data could not be encoded.
+        modules: std::result::Result<Vec<u8>, String>,
+        /// The human readable interpretation (HRI) printed with the bars.
+        text: String,
+        height: u8,
+        module_width: u8,
+        hri_position: u8,
+        alignment: Alignment,
+        offset: u16,
+        print_area_width: u16,
+    },
     PaperCut {
         cut_type: String,
     },
@@ -134,8 +151,11 @@ struct PrinterState {
     line_spacing: u8,
     character_spacing: u8,
     double_strike: bool,
-    font: u8,        // 0=Font A, 1=Font B, etc.
-    utf8_mode: bool, // FS ( C fn=48 m=2 - Epson UTF-8 encode system
+    font: u8,                 // 0=Font A, 1=Font B, etc.
+    utf8_mode: bool,          // FS ( C fn=48 m=2 - Epson UTF-8 encode system
+    barcode_height: u8,       // GS h n - bar height in dots
+    barcode_module_width: u8, // GS w n - narrowest bar in dots
+    hri_position: u8,         // GS H n - 0 none, 1 above, 2 below, 3 both
 }
 
 impl Default for PrinterState {
@@ -158,6 +178,9 @@ impl Default for PrinterState {
             double_strike: false,
             font: 0, // Default: Font A
             utf8_mode: false,
+            barcode_height: 162,
+            barcode_module_width: 3,
+            hri_position: 0,
         }
     }
 }
@@ -1077,32 +1100,88 @@ impl EscPosRenderer {
                     i += 2;
                 }
             }
-            b'H' | b'h' | b'w' | b'k' => {
-                // Barcode height, HRI position, barcode width, barcode print
+            b'h' => {
+                // GS h n - barcode height in dots (1-255)
                 i += 1;
                 if i < data.len() {
-                    if cmd == b'k' {
-                        // Barcode data follows
-                        let barcode_type = data[i];
-                        i += 1;
-                        if barcode_type < 6 {
-                            // Variable length barcode - find NUL terminator
-                            while i < data.len() && data[i] != 0 {
-                                i += 1;
-                            }
-                            if i < data.len() {
-                                i += 1; // skip NUL
-                            }
-                        } else {
-                            // Fixed length barcode
-                            if i < data.len() {
-                                let len = data[i] as usize;
-                                i += 1 + len;
-                            }
-                        }
+                    self.state.barcode_height = data[i].max(1);
+                    i += 1;
+                }
+            }
+            b'w' => {
+                // GS w n - barcode module width: 2-6 (some models also
+                // accept 68-76 for finer steps, mapped back here)
+                i += 1;
+                if i < data.len() {
+                    let n = data[i];
+                    let n = if (68..=76).contains(&n) {
+                        (n - 66) / 2
                     } else {
+                        n
+                    };
+                    self.state.barcode_module_width = n.clamp(1, 6);
+                    i += 1;
+                }
+            }
+            b'H' => {
+                // GS H n - HRI position: 0/48 none, 1/49 above, 2/50 below,
+                // 3/51 both
+                i += 1;
+                if i < data.len() {
+                    self.state.hri_position = data[i] % 48 % 4;
+                    i += 1;
+                }
+            }
+            b'k' => {
+                // GS k m d1...dk NUL (function A, m = 0-6) or
+                // GS k m n d1...dn (function B, m = 65-73)
+                i += 1;
+                if i < data.len() {
+                    let m = data[i];
+                    i += 1;
+                    let payload: Vec<u8> = if m <= 6 {
+                        let start = i;
+                        while i < data.len() && data[i] != 0 {
+                            i += 1;
+                        }
+                        let d = data[start..i].to_vec();
+                        if i < data.len() {
+                            i += 1; // skip NUL
+                        }
+                        d
+                    } else if i < data.len() {
+                        let n = data[i] as usize;
                         i += 1;
+                        let end = (i + n).min(data.len());
+                        let d = data[i..end].to_vec();
+                        i = end;
+                        d
+                    } else {
+                        Vec::new()
+                    };
+                    if !self.current_line.is_empty() {
+                        self.flush_line();
+                        self.current_line.clear();
                     }
+                    let (symbology, text, modules) = barcode::encode(m, &payload);
+                    self.log_debug(&format!(
+                        "GS k: {} {:?} ({} bytes)",
+                        symbology,
+                        text,
+                        payload.len()
+                    ));
+                    self.elements.push(ReceiptElement::Barcode {
+                        symbology,
+                        modules,
+                        text,
+                        height: self.state.barcode_height,
+                        module_width: self.state.barcode_module_width,
+                        hri_position: self.state.hri_position,
+                        alignment: self.state.alignment.clone(),
+                        offset: self.state.horizontal_offset,
+                        print_area_width: self.state.print_area_width,
+                    });
+                    self.state.horizontal_offset = 0;
                 }
             }
             b'(' => {
@@ -2327,6 +2406,33 @@ impl eframe::App for VirtualEscPosApp {
                                                     printer_width_px,
                                                 );
                                             }
+                                            ReceiptElement::Barcode {
+                                                symbology,
+                                                modules,
+                                                text,
+                                                height,
+                                                module_width,
+                                                hri_position,
+                                                alignment,
+                                                offset,
+                                                print_area_width,
+                                            } => {
+                                                render_barcode(
+                                                    ui,
+                                                    BarcodeView {
+                                                        symbology,
+                                                        modules,
+                                                        text,
+                                                        height: *height,
+                                                        module_width: *module_width,
+                                                        hri_position: *hri_position,
+                                                        alignment,
+                                                        offset: *offset,
+                                                        print_area_width: *print_area_width,
+                                                    },
+                                                    printer_width_px,
+                                                );
+                                            }
                                             ReceiptElement::PaperCut { cut_type } => {
                                                 ui.separator();
                                                 ui.horizontal(|ui| {
@@ -2572,6 +2678,120 @@ fn render_qr_code(
     }
 }
 
+/// A barcode element, as [render_barcode] draws it.
+struct BarcodeView<'a> {
+    symbology: &'a str,
+    modules: &'a std::result::Result<Vec<u8>, String>,
+    text: &'a str,
+    height: u8,
+    module_width: u8,
+    hri_position: u8,
+    alignment: &'a Alignment,
+    offset: u16,
+    print_area_width: u16,
+}
+
+fn render_barcode(ui: &mut egui::Ui, b: BarcodeView, printer_width_px: f32) {
+    let modules = match b.modules {
+        Ok(m) if !m.is_empty() => m,
+        Ok(_) => return,
+        Err(e) => {
+            ui.colored_label(
+                egui::Color32::RED,
+                format!("Barcode Error ({}): {}", b.symbology, e),
+            );
+            return;
+        }
+    };
+
+    // A real printer prints nothing when the bars do not fit; shrinking
+    // the module keeps the preview useful instead.
+    let mut module = b.module_width.max(1) as usize;
+    while module > 1 && (modules.len() * module) as f32 > printer_width_px {
+        module -= 1;
+    }
+    let width = modules.len() * module;
+    let height = b.height.max(1) as usize;
+
+    let mut row = Vec::with_capacity(width);
+    for &bit in modules {
+        let color = if bit == 1 {
+            egui::Color32::BLACK
+        } else {
+            egui::Color32::WHITE
+        };
+        row.resize(row.len() + module, color);
+    }
+    let mut pixels = Vec::with_capacity(width * height);
+    for _ in 0..height {
+        pixels.extend_from_slice(&row);
+    }
+    let image = egui::ColorImage {
+        size: [width, height],
+        pixels,
+    };
+    let texture = ui.ctx().load_texture(
+        format!("barcode_{}_{}", b.symbology, b.text),
+        image,
+        egui::TextureOptions::NEAREST,
+    );
+
+    // Same placement rules as QR codes: GS W print area, alignment, then
+    // an explicit horizontal offset.
+    let effective_width = if b.print_area_width > 0 {
+        b.print_area_width as f32
+    } else {
+        printer_width_px
+    };
+    let area_offset = if b.print_area_width > 0 {
+        (printer_width_px - b.print_area_width as f32) / 2.0
+    } else {
+        0.0
+    };
+    let base_x = match b.alignment {
+        Alignment::Left => 0.0,
+        Alignment::Center => area_offset + (effective_width - width as f32) / 2.0,
+        Alignment::Right => area_offset + effective_width - width as f32,
+    };
+    let final_x = if b.offset > 0 {
+        b.offset as f32
+    } else {
+        base_x
+    };
+
+    let hri_label = |ui: &mut egui::Ui| {
+        let (rect, _) =
+            ui.allocate_exact_size(egui::vec2(printer_width_px, 16.0), egui::Sense::hover());
+        ui.painter().text(
+            egui::pos2(rect.left() + final_x + width as f32 / 2.0, rect.center().y),
+            egui::Align2::CENTER_CENTER,
+            b.text,
+            egui::FontId::monospace(12.0),
+            egui::Color32::BLACK,
+        );
+    };
+
+    if b.hri_position == 1 || b.hri_position == 3 {
+        hri_label(ui);
+    }
+    let (rect, _) = ui.allocate_exact_size(
+        egui::vec2(printer_width_px, height as f32),
+        egui::Sense::hover(),
+    );
+    ui.painter().image(
+        texture.id(),
+        egui::Rect::from_min_size(
+            egui::pos2(rect.left() + final_x, rect.top()),
+            egui::vec2(width as f32, height as f32),
+        ),
+        egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+        egui::Color32::WHITE,
+    );
+    if b.hri_position == 2 || b.hri_position == 3 {
+        hri_label(ui);
+    }
+}
+
 async fn handle_client(
     mut socket: tokio::net::TcpStream,
     addr: std::net::SocketAddr,
@@ -2712,4 +2932,87 @@ fn main() -> Result<()> {
         Box::new(move |cc| Ok(Box::new(VirtualEscPosApp::new(cc, state)))),
     )
     .map_err(|e| anyhow::anyhow!("Failed to run app: {}", e))
+}
+
+#[cfg(test)]
+mod barcode_tests {
+    use super::*;
+
+    fn barcode(el: &ReceiptElement) -> (&'static str, &str, u8, u8, u8, bool) {
+        match el {
+            ReceiptElement::Barcode {
+                symbology,
+                text,
+                height,
+                module_width,
+                hri_position,
+                modules,
+                ..
+            } => (
+                symbology,
+                text.as_str(),
+                *height,
+                *module_width,
+                *hri_position,
+                modules.is_ok(),
+            ),
+            other => panic!("expected a Barcode element, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn gs_k_function_b_code128_becomes_a_barcode_with_its_settings() {
+        let mut r = EscPosRenderer::new(false);
+        let mut data = b"\x1D\x68\x3C\x1D\x77\x03\x1D\x48\x02".to_vec(); // h 60, w 3, HRI below
+        data.extend_from_slice(b"\x1D\x6B\x49\x0A{BRF457985");
+        data.extend_from_slice(b"after\n");
+        r.process_data(&data).unwrap();
+        let els = r.take_elements();
+        assert_eq!(barcode(&els[0]), ("CODE128", "RF457985", 60, 3, 2, true));
+        match &els[1] {
+            ReceiptElement::Text { content, .. } => assert_eq!(content, "after"),
+            other => panic!("the text after the barcode was eaten: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn gs_k_function_a_is_nul_terminated_codabar_included() {
+        // m = 6 (CODABAR) is function A too: its data ends at NUL. It used
+        // to be read as a length, eating the bytes after it.
+        let mut r = EscPosRenderer::new(false);
+        r.process_data(b"\x1D\x6B\x06A40156B\x00next\n").unwrap();
+        let els = r.take_elements();
+        let (name, text, ..) = barcode(&els[0]);
+        assert_eq!((name, text), ("CODABAR", "A40156B"));
+        match &els[1] {
+            ReceiptElement::Text { content, .. } => assert_eq!(content, "next"),
+            other => panic!("expected the next line, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn gs_k_function_a_ean13() {
+        let mut r = EscPosRenderer::new(false);
+        r.process_data(b"\x1D\x6B\x024006381333931\x00").unwrap();
+        let els = r.take_elements();
+        assert_eq!(barcode(&els[0]).0, "EAN-13");
+        assert!(barcode(&els[0]).5);
+    }
+
+    #[test]
+    fn esc_at_resets_the_barcode_settings() {
+        let mut r = EscPosRenderer::new(false);
+        r.process_data(b"\x1D\x68\x20\x1D\x77\x06\x1D\x48\x03\x1B\x40")
+            .unwrap();
+        assert_eq!(r.state.barcode_height, 162);
+        assert_eq!(r.state.barcode_module_width, 3);
+        assert_eq!(r.state.hri_position, 0);
+    }
+
+    #[test]
+    fn gs_h_accepts_ascii_digits() {
+        let mut r = EscPosRenderer::new(false);
+        r.process_data(b"\x1D\x48\x32").unwrap(); // '2'
+        assert_eq!(r.state.hri_position, 2);
+    }
 }
