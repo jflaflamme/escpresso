@@ -114,7 +114,7 @@ cat receipt.raw | nc -w 1 localhost 9100              # then send
 | Line spacing | ESC 2, ESC 3, ESC d, ESC J |
 | Graphics | ESC \* (bit image), GS v 0 (raster) |
 | QR codes | GS ( k |
-| Barcodes | GS k, GS H, GS h, GS w |
+| Barcodes | GS k (UPC-A, EAN-13, EAN-8, CODE39, ITF, CODABAR, CODE93, CODE128), GS H, GS h, GS w |
 | Paper control | GS V (cut), ESC p (cash drawer) |
 | Code pages | ESC t (code table selection) |
 | Character sets | ESC R (international), FS commands (Kanji) |
@@ -151,10 +151,10 @@ cat tests/raw/test1_format.raw | nc -w 1 localhost 9100
 
 ## Code Structure
 
-The codebase is a single `src/main.rs` with these main components:
+The codebase is `src/main.rs` plus `src/barcode.rs` (GS k barcode encoding), with these main components:
 
 - **`EscPosRenderer`** — The ESC/POS command parser and state machine. Processes raw bytes into `ReceiptElement`s.
-- **`ReceiptElement`** — Enum representing rendered items: text lines, raster images, QR codes, separators, paper cuts.
+- **`ReceiptElement`** — Enum representing rendered items: text lines, raster images, QR codes, barcodes, separators, paper cuts.
 - **`PrinterState`** — Tracks current formatting (bold, underline, alignment, density, code page, etc.).
 - **`PaperSize`** — 58mm or 80mm paper width configuration.
 - **TCP server** — Async Tokio listener that accepts connections and feeds data to the renderer.

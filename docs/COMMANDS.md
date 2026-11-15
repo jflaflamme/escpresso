@@ -135,10 +135,16 @@ Other control characters (0x00-0x1F) are silently ignored.
 
 | Command | Hex | Description | Status |
 |---------|-----|-------------|--------|
-| GS H    | 1D 48 n | Select HRI printing position | ✅ Implemented (consumed) |
-| GS h    | 1D 68 n | Set barcode height | ✅ Implemented (consumed) |
-| GS w    | 1D 77 n | Set barcode width | ✅ Implemented (consumed) |
-| GS k    | 1D 6B m [data] | Print barcode | ✅ Implemented (data consumed) |
+| GS H    | 1D 48 n | Select HRI printing position | ✅ Implemented (none / above / below / both) |
+| GS h    | 1D 68 n | Set barcode height | ✅ Implemented |
+| GS w    | 1D 77 n | Set barcode width | ✅ Implemented (module 1-6 dots) |
+| GS k    | 1D 6B m [data] | Print barcode | ✅ Rendered: UPC-A, EAN-13, EAN-8, CODE39, ITF, CODABAR, CODE93, CODE128 (function A and B); UPC-E shown as not drawn |
+
+CODE128 follows the ESC/POS data format: the data starts with `{A`, `{B` or
+`{C` to select the code set, `{A`/`{B`/`{C` switch sets later on, `{S` is
+SHIFT, `{1`-`{4` are FNC1-FNC4 and `{{` is a literal `{`. In code set C each
+byte is a value 0-99. A barcode wider than the paper is drawn with a narrower
+module rather than dropped, so the preview stays readable.
 
 ### Extended Commands
 
